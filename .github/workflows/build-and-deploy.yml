@@ -1,0 +1,117 @@
+name: Build and Deploy
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      # Checkout code
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Setup Java for Dependency Check
+      - name: Setup Java for Dependency Check
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      # Install dependencies
+      - name: Install dependencies
+        run: npm install
+
+      # Setup OWASP Dependency Check
+      - name: Setup OWASP Dependency Check
+        run: |
+          echo "Downloading OWASP Dependency Check..."
+          VERSION="8.4.0"
+          wget -q "https://github.com/jeremylong/DependencyCheck/releases/download/v${VERSION}/dependency-check-${VERSION}-release.zip"
+          unzip -q "dependency-check-${VERSION}-release.zip"
+          chmod +x dependency-check/bin/dependency-check.sh
+
+      # Run OWASP Dependency Check
+      - name: Run OWASP Dependency Check
+        run: |
+          echo "Scanning for vulnerable dependencies..."
+          mkdir -p dependency-reports
+          ./dependency-check/bin/dependency-check.sh \
+            --scan "." \
+            --format "HTML" \
+            --out "./dependency-reports" \
+            --project "security-pipeline-app" \
+            --failOnCVSS 8 \
+            --exclude "**/node_modules/**" \
+            --exclude "**/test/**" || echo "Dependency check completed"
+
+      # Upload Dependency Check Report
+      - name: Upload Dependency Check Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-check-report
+          path: dependency-reports/dependency-check-report.html
+          retention-days: 30
+
+      # Run SonarQube analysis
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # Deploy to server
+      - name: Deploy to Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo git config --global --add safe.directory /home/ubuntu/security-pipeline-app
+            cd /home/ubuntu/security-pipeline-app
+            sudo git pull origin main
+            sudo chown -R ubuntu:ubuntu /home/ubuntu/security-pipeline-app
+            npm install
+            sudo npm install -g pm2
+            pm2 restart webtest-app || pm2 start ecosystem.config.js --name "webtest-app"
+            sudo systemctl reload nginx
+            echo "Deployment completed successfully!"
+
+      # Wait for deployment
+      - name: Wait for site to be ready
+        run: |
+          echo "Waiting 30 seconds for deployment..."
+          sleep 30
+
+      # OWASP ZAP Security Scan
+      - name: Security Scan with OWASP ZAP
+        run: |
+          sudo apt update
+          sudo apt install snapd -y
+          sudo snap install zaproxy --classic
+          sleep 10
+          mkdir -p ${{ github.workspace }}/security-reports
+          zaproxy -cmd \
+            -quickurl https://node.yasirbhati.site/ \
+            -quickprogress \
+            -quickout ${{ github.workspace }}/security-reports/zap-security-report.html \
+            -config connection.timeoutInSecs=120
+          echo "Security scan completed!"
+
+      # Upload security report
+      - name: Upload Security Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-security-report
+          path: ${{ github.workspace }}/security-reports/zap-security-report.html
+          retention-days: 30
